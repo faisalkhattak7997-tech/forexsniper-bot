@@ -1,0 +1,54 @@
+name: ForexSniper AI Trainer
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # Train every day at midnight UTC
+  workflow_dispatch:        # Manual trigger anytime
+
+permissions:
+  contents: write
+
+jobs:
+  train-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy scikit-learn
+          pip install tensorflow==2.13.0 tf2onnx onnx onnxruntime
+
+      - name: Train AI model on real market data
+        run: |
+          cd Python
+          python train_model.py
+
+      - name: Copy model to docs folder (served via GitHub Pages)
+        run: |
+          mkdir -p docs/model
+          cp Python/model/ForexSniper_AI.onnx docs/model/
+          cp Python/model/metadata.json        docs/model/
+          cp Python/model/scaler_params.json   docs/model/
+
+      - name: Commit and push trained model
+        run: |
+          git config user.name  "ForexSniper AI Bot"
+          git config user.email "bot@forexsniper.ai"
+          git add docs/model/
+          git diff --cached --quiet || git commit -m "🤖 AI model retrained $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+
+      - name: Show training summary
+        run: |
+          echo "=== Training Complete ==="
+          cat Python/model/metadata.json
