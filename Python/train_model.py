@@ -1,300 +1,263 @@
 """
-ForexSniper Pro — Real AI Model Trainer
+ForexSniper Pro — LSTM AI Trainer v2.0
 ========================================
-Runs on GitHub Actions every day.
-Downloads REAL price data → Trains LSTM model → Exports ONNX
-MT5 EA fetches the model automatically.
+Architecture: LSTM + Attention (same class as AI Forex Robot $2,299)
+Features: 32 features including Supply/Demand zones
+Training: Real market data — 8 pairs, 2 years history
+Auto-runs daily on GitHub Actions
 
 Author: Faisal Khattak | t.me/ForexSniper7997
 """
 
-import os
-import json
+import os, json
 import numpy as np
 import pandas as pd
 import warnings
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-print("=" * 60)
-print("  ForexSniper Pro — Real AI Trainer")
-print("  Running on GitHub Actions")
-print("=" * 60)
+print("="*60)
+print("  ForexSniper Pro — LSTM AI Trainer v2.0")
+print("  Architecture: LSTM + Attention Network")
+print("="*60)
 
-# ── STEP 1: DOWNLOAD REAL PRICE DATA ─────────────────────────────
-print("\n[1/5] Downloading real market data...")
-
+# STEP 1: DOWNLOAD REAL PRICE DATA
+print("\n[1/6] Downloading real market data...")
 import yfinance as yf
 
 PAIRS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "USDCAD": "USDCAD=X",
-    "XAUUSD": "GC=F",
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
+    "EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","USDJPY":"USDJPY=X",
+    "AUDUSD":"AUDUSD=X","USDCAD":"USDCAD=X","XAUUSD":"GC=F",
+    "BTCUSD":"BTC-USD","ETHUSD":"ETH-USD",
 }
 
 all_data = {}
 for name, ticker in PAIRS.items():
     try:
-        df = yf.download(ticker, period="2y", interval="1h",
-                        progress=False, auto_adjust=True)
+        df = yf.download(ticker, period="2y", interval="1h", progress=False, auto_adjust=True)
         if len(df) > 500:
             all_data[name] = df
-            print(f"  ✅ {name}: {len(df)} bars")
+            print(f"  OK {name}: {len(df)} bars")
         else:
-            print(f"  ⚠️  {name}: insufficient data ({len(df)} bars)")
+            print(f"  SKIP {name}: {len(df)} bars")
     except Exception as e:
-        print(f"  ❌ {name}: {e}")
+        print(f"  FAIL {name}: {e}")
 
 if not all_data:
-    print("ERROR: No data downloaded. Check network.")
+    print("ERROR: No data downloaded.")
     exit(1)
 
-print(f"  Downloaded {len(all_data)} pairs successfully")
+# STEP 2: FEATURE ENGINEERING (32 features)
+print(f"\n[2/6] Engineering features from {len(all_data)} pairs...")
 
-# ── STEP 2: FEATURE ENGINEERING ──────────────────────────────────
-print("\n[2/5] Engineering features from real price data...")
+def rsi(s, p=14):
+    d=s.diff(); g=d.clip(lower=0).rolling(p).mean(); l=(-d.clip(upper=0)).rolling(p).mean()
+    return 100-(100/(1+g/(l+1e-10)))
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / (loss + 1e-10)
-    return 100 - (100 / (1 + rs))
+def atr_fn(h,l,c,p=14):
+    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    return tr.rolling(p).mean()
 
-def compute_features(df):
-    """
-    Extract 20 real market features from OHLCV data.
-    These are the SAME features the MT5 EA will compute.
-    """
-    close = df['Close'].squeeze()
-    high  = df['High'].squeeze()
-    low   = df['Low'].squeeze()
-    vol   = df['Volume'].squeeze() if 'Volume' in df.columns else pd.Series(1, index=close.index)
+def supply_demand(h,l,c,lb=20):
+    n=len(c); ds=pd.Series(0.0,index=c.index); ss=pd.Series(0.0,index=c.index)
+    for i in range(lb,n):
+        wh=h.iloc[i-lb:i]; wl=l.iloc[i-lb:i]; wc=c.iloc[i-lb:i]
+        ll=wl.min(); li=wl.idxmin(); ca=wc[li:].max()
+        if ll>0: ds.iloc[i]=(ca-ll)/ll
+        lh=wh.max(); hi=wh.idxmax(); cb=wc[hi:].min()
+        if lh>0: ss.iloc[i]=(lh-cb)/lh
+    return ds, ss
 
-    features = pd.DataFrame(index=close.index)
+def build_features(df):
+    c=df['Close'].squeeze(); h=df['High'].squeeze()
+    l=df['Low'].squeeze();   o=df['Open'].squeeze()
+    ft=pd.DataFrame(index=c.index)
 
-    # Price-based features
-    features['rsi_14']      = compute_rsi(close, 14) / 100.0
-    features['rsi_7']       = compute_rsi(close, 7)  / 100.0
+    # RSI
+    ft['rsi14']=rsi(c,14)/100; ft['rsi7']=rsi(c,7)/100; ft['rsi21']=rsi(c,21)/100
 
-    # EMA features
-    ema8   = close.ewm(span=8,   adjust=False).mean()
-    ema21  = close.ewm(span=21,  adjust=False).mean()
-    ema50  = close.ewm(span=50,  adjust=False).mean()
-    ema200 = close.ewm(span=200, adjust=False).mean()
-
-    features['ema8_dist']   = (close - ema8)   / (close + 1e-10)
-    features['ema21_dist']  = (close - ema21)  / (close + 1e-10)
-    features['ema50_dist']  = (close - ema50)  / (close + 1e-10)
-    features['ema200_dist'] = (close - ema200) / (close + 1e-10)
-    features['ema_align']   = ((ema8 > ema21) & (ema21 > ema50)).astype(float) - \
-                              ((ema8 < ema21) & (ema21 < ema50)).astype(float)
+    # EMA
+    e8=c.ewm(span=8,adjust=False).mean(); e21=c.ewm(span=21,adjust=False).mean()
+    e50=c.ewm(span=50,adjust=False).mean(); e200=c.ewm(span=200,adjust=False).mean()
+    ft['e8d']=(c-e8)/(c+1e-10); ft['e21d']=(c-e21)/(c+1e-10)
+    ft['e50d']=(c-e50)/(c+1e-10); ft['e200d']=(c-e200)/(c+1e-10)
+    ft['ema_bull']=((e8>e21)&(e21>e50)&(e50>e200)).astype(float)
+    ft['ema_bear']=((e8<e21)&(e21<e50)&(e50<e200)).astype(float)
 
     # MACD
-    macd_line   = close.ewm(span=12, adjust=False).mean() - \
-                  close.ewm(span=26, adjust=False).mean()
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    histogram   = macd_line - signal_line
-    features['macd_hist']   = histogram / (close.abs() + 1e-10) * 100
-    features['macd_signal'] = (macd_line > signal_line).astype(float) - \
-                              (macd_line < signal_line).astype(float)
+    ml=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean()
+    sl=ml.ewm(span=9,adjust=False).mean(); hist=ml-sl
+    ft['macd_hist']=hist/(c.abs()+1e-10)*1000
+    ft['macd_sig']=(ml>sl).astype(float)
+    ft['macd_cup']=((ml>sl)&(ml.shift()<=sl.shift())).astype(float)
+    ft['macd_cdn']=((ml<sl)&(ml.shift()>=sl.shift())).astype(float)
 
-    # Bollinger Bands
-    bb_mid   = close.rolling(20).mean()
-    bb_std   = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    bb_range = (bb_upper - bb_lower) / (bb_mid + 1e-10)
-    bb_pos   = (close - bb_lower) / (bb_upper - bb_lower + 1e-10)
-    features['bb_position'] = bb_pos.clip(0, 1)
-    features['bb_width']    = bb_range
+    # Bollinger
+    bm=c.rolling(20).mean(); bs=c.rolling(20).std()
+    bu=bm+2*bs; bl2=bm-2*bs
+    ft['bb_pos']=((c-bl2)/(bu-bl2+1e-10)).clip(0,1)
+    ft['bb_wid']=((bu-bl2)/(bm+1e-10)).clip(0,0.2)/0.2
+    ft['bb_sqz']=(ft['bb_wid']<ft['bb_wid'].rolling(20).mean()).astype(float)
 
-    # ATR (volatility)
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    atr14  = tr.rolling(14).mean()
-    atr_avg= atr14.rolling(50).mean()
-    features['atr_ratio']   = (atr14 / (atr_avg + 1e-10)).clip(0, 5) / 5.0
+    # ATR
+    a14=atr_fn(h,l,c,14); a50=atr_fn(h,l,c,50)
+    ft['atr_rat']=(a14/(a50+1e-10)).clip(0,5)/5
+    ft['atr_pct']=(a14/(c+1e-10)).clip(0,0.05)/0.05
+    ft['atr_up']=(a14>a50).astype(float)
 
     # Price action
-    body   = (close - df['Open'].squeeze()).abs()
-    candle = high - low
-    features['body_ratio']  = (body / (candle + 1e-10)).clip(0, 1)
-    features['is_bullish']  = (close > df['Open'].squeeze()).astype(float)
+    body=(c-o).abs(); rng=(h-l).clip(lower=1e-10)
+    uw=h-pd.concat([c,o],axis=1).max(axis=1)
+    lw=pd.concat([c,o],axis=1).min(axis=1)-l
+    ft['body_r']=(body/rng).clip(0,1); ft['bull']=(c>o).astype(float)
+    ft['pin_b']=((lw/rng>0.6)&(body/rng<0.3)).astype(float)
+    ft['pin_s']=((uw/rng>0.6)&(body/rng<0.3)).astype(float)
+    ft['engulf']=((c>o)&(c>o.shift())&(o<c.shift())&(body>body.shift())).astype(float)
 
     # Momentum
-    features['mom_5']  = close.pct_change(5).clip(-0.1, 0.1)  / 0.1
-    features['mom_20'] = close.pct_change(20).clip(-0.2, 0.2) / 0.2
+    ft['mom5']=c.pct_change(5).clip(-0.1,0.1)/0.1
+    ft['mom20']=c.pct_change(20).clip(-0.2,0.2)/0.2
+    ft['mom60']=c.pct_change(60).clip(-0.3,0.3)/0.3
+    ft['roc']=(c/c.shift(10)-1).clip(-0.1,0.1)/0.1
 
-    return features.dropna()
+    # Supply/Demand zones
+    ds,ss=supply_demand(h,l,c)
+    ft['demand']=ds.clip(0,0.05)/0.05
+    ft['supply']=ss.clip(0,0.05)/0.05
 
-def compute_labels(df, features_index, horizon=3, threshold=0.0003):
-    """
-    Real labels: did price go up or down significantly in next N bars?
-    0 = SELL, 1 = HOLD, 2 = BUY
-    """
-    close = df['Close'].squeeze().reindex(features_index)
-    future_return = close.shift(-horizon) / close - 1
+    # Stochastic
+    ll14=l.rolling(14).min(); hh14=h.rolling(14).max()
+    sk=((c-ll14)/(hh14-ll14+1e-10)*100)
+    ft['stoch_k']=sk.clip(0,100)/100
+    ft['stoch_d']=sk.rolling(3).mean().clip(0,100)/100
 
-    labels = np.where(future_return >  threshold, 2,   # BUY
-             np.where(future_return < -threshold, 0,   # SELL
-                      1))                              # HOLD
-    return labels[:-horizon]  # remove last N rows (no future data)
+    return ft.dropna()
 
-# Build dataset from all pairs
-X_all = []
-y_all = []
+def build_labels(df, fidx, horizon=3, thresh=0.0002):
+    c=df['Close'].squeeze().reindex(fidx)
+    r=c.shift(-horizon)/c-1
+    lb=np.where(r>thresh,2,np.where(r<-thresh,0,1))
+    return lb[:-horizon]
 
+X_all, y_all = [], []
 for name, df in all_data.items():
     try:
-        feats  = compute_features(df)
-        labels = compute_labels(df, feats.index, horizon=3, threshold=0.0002)
-        n      = len(labels)
-        X_all.append(feats.values[:n])
-        y_all.append(labels)
-        print(f"  {name}: {n} samples | BUY:{(labels==2).sum()} HOLD:{(labels==1).sum()} SELL:{(labels==0).sum()}")
+        ft=build_features(df); lb=build_labels(df,ft.index)
+        n=len(lb); X_all.append(ft.values[:n]); y_all.append(lb)
+        print(f"  {name}: {n} samples BUY:{(lb==2).sum()} HOLD:{(lb==1).sum()} SELL:{(lb==0).sum()}")
     except Exception as e:
-        print(f"  ⚠️  {name} feature error: {e}")
+        print(f"  SKIP {name}: {e}")
 
-X = np.vstack(X_all).astype(np.float32)
-y = np.concatenate(y_all).astype(np.int32)
+X_flat=np.vstack(X_all).astype(np.float32)
+y_flat=np.concatenate(y_all).astype(np.int32)
+N_FEAT=X_flat.shape[1]
+SEQ_LEN=20
+print(f"\n  Total: {len(X_flat)} samples | Features: {N_FEAT}")
 
-print(f"\n  Total samples: {len(X)}")
-print(f"  Features: {X.shape[1]}")
-print(f"  BUY:{(y==2).sum()} HOLD:{(y==1).sum()} SELL:{(y==0).sum()}")
-
-# ── STEP 3: TRAIN MODEL ───────────────────────────────────────────
-print("\n[3/5] Training model on real data...")
-
+# STEP 3: SCALE + BUILD SEQUENCES
+print(f"\n[3/6] Scaling and building sequences (lookback={SEQ_LEN})...")
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.utils.class_weight import compute_class_weight
+
+scaler=StandardScaler()
+Xs=scaler.fit_transform(X_flat).astype(np.float32)
+
+os.makedirs("model",exist_ok=True)
+with open("model/scaler_params.json","w") as f:
+    json.dump({
+        "mean": scaler.mean_.tolist(),
+        "scale": scaler.scale_.tolist(),
+        "n_features": int(N_FEAT),
+        "sequence_len": SEQ_LEN,
+        "version": "2.0-LSTM"
+    }, f, indent=2)
+
+def make_seq(X,y,sl):
+    Xo,yo=[],[]
+    for i in range(sl,len(X)):
+        Xo.append(X[i-sl:i]); yo.append(y[i])
+    return np.array(Xo,dtype=np.float32),np.array(yo,dtype=np.int32)
+
+X_seq,y_seq=make_seq(Xs,y_flat,SEQ_LEN)
+print(f"  Sequence shape: {X_seq.shape}")
+
+sp=int(len(X_seq)*0.8)
+Xtr,Xte=X_seq[:sp],X_seq[sp:]
+ytr,yte=y_seq[:sp],y_seq[sp:]
+
+# STEP 4: BUILD LSTM MODEL
+print("\n[4/6] Building LSTM + Attention model...")
 import tensorflow as tf
 
-# Scale features
-scaler     = StandardScaler()
-X_scaled   = scaler.fit_transform(X).astype(np.float32)
+cw_v=compute_class_weight('balanced',classes=np.unique(ytr),y=ytr)
+cw={i:cw_v[i] for i in range(len(cw_v))}
 
-# Save scaler params for MT5
-scaler_params = {
-    "mean":  scaler.mean_.tolist(),
-    "scale": scaler.scale_.tolist(),
-    "n_features": int(X.shape[1]),
-    "feature_names": [
-        "rsi_14","rsi_7","ema8_dist","ema21_dist","ema50_dist",
-        "ema200_dist","ema_align","macd_hist","macd_signal",
-        "bb_position","bb_width","atr_ratio","body_ratio",
-        "is_bullish","mom_5","mom_20"
-    ]
-}
+inp=tf.keras.Input(shape=(SEQ_LEN,N_FEAT))
+x=tf.keras.layers.LSTM(128,return_sequences=True,dropout=0.2,recurrent_dropout=0.1)(inp)
+x=tf.keras.layers.LSTM(64, return_sequences=True,dropout=0.2,recurrent_dropout=0.1)(x)
+# Attention
+at=tf.keras.layers.Dense(1,activation='tanh')(x)
+at=tf.keras.layers.Flatten()(at)
+at=tf.keras.layers.Activation('softmax')(at)
+at=tf.keras.layers.RepeatVector(64)(at)
+at=tf.keras.layers.Permute([2,1])(at)
+xm=tf.keras.layers.Multiply()([x,at])
+xm=tf.keras.layers.Lambda(lambda z:tf.reduce_sum(z,axis=1))(xm)
+x=tf.keras.layers.Dense(64,activation='relu')(xm)
+x=tf.keras.layers.BatchNormalization()(x)
+x=tf.keras.layers.Dropout(0.3)(x)
+x=tf.keras.layers.Dense(32,activation='relu')(x)
+out=tf.keras.layers.Dense(3,activation='softmax')(x)
 
-os.makedirs("model", exist_ok=True)
-with open("model/scaler_params.json","w") as f:
-    json.dump(scaler_params, f, indent=2)
+model=tf.keras.Model(inp,out)
+model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
+              loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+print(f"  Parameters: {model.count_params():,}")
 
-# Train/test split — use time-based split (no leakage)
-split = int(len(X_scaled) * 0.8)
-X_train, X_test = X_scaled[:split], X_scaled[split:]
-y_train, y_test = y[:split], y[split:]
+# STEP 5: TRAIN
+print("\n[5/6] Training...")
+model.fit(Xtr,ytr,validation_data=(Xte,yte),epochs=60,batch_size=256,
+          class_weight=cw,verbose=1,
+          callbacks=[
+              tf.keras.callbacks.EarlyStopping(patience=10,restore_best_weights=True,monitor='val_accuracy'),
+              tf.keras.callbacks.ReduceLROnPlateau(patience=5,factor=0.5,min_lr=1e-5)
+          ])
 
-# Build model — proven architecture for financial time series
-model = tf.keras.Sequential([
-    tf.keras.layers.Dense(256, activation='relu', input_shape=(X.shape[1],)),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(128, activation='relu'),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dropout(0.2),
-    tf.keras.layers.Dense(64, activation='relu'),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dropout(0.2),
-    tf.keras.layers.Dense(32, activation='relu'),
-    tf.keras.layers.Dense(3, activation='softmax')  # SELL / HOLD / BUY
-])
-
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-    loss='sparse_categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-# Class weights to handle imbalance
-from sklearn.utils.class_weight import compute_class_weight
-class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-cw = {i: class_weights[i] for i in range(len(class_weights))}
-
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=50,
-    batch_size=512,
-    class_weight=cw,
-    callbacks=[
-        tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.5)
-    ],
-    verbose=0
-)
-
-# Evaluate
-y_pred = model.predict(X_test, verbose=0).argmax(axis=1)
-acc    = accuracy_score(y_test, y_pred)
+yp=model.predict(Xte,verbose=0).argmax(axis=1)
+acc=accuracy_score(yte,yp)
 print(f"\n  Test Accuracy: {acc*100:.2f}%")
-print("\n  Classification Report:")
-print(classification_report(y_test, y_pred, target_names=["SELL","HOLD","BUY"]))
+print(classification_report(yte,yp,target_names=["SELL","HOLD","BUY"]))
 
-# ── STEP 4: EXPORT TO ONNX ────────────────────────────────────────
-print("\n[4/5] Exporting to ONNX format...")
+# STEP 6: EXPORT ONNX
+print("\n[6/6] Exporting ONNX...")
+import tf2onnx, onnx
 
-import tf2onnx
-import onnx
-
-# Convert to ONNX
-input_signature = [tf.TensorSpec([None, X.shape[1]], tf.float32, name="input")]
-onnx_model, _ = tf2onnx.convert.from_keras(
-    model,
-    input_signature=input_signature,
-    opset=12,
-    output_path="model/ForexSniper_AI.onnx"
-)
-
-# Verify
-onnx_model_loaded = onnx.load("model/ForexSniper_AI.onnx")
-onnx.checker.check_model(onnx_model_loaded)
-onnx_size = os.path.getsize("model/ForexSniper_AI.onnx") / 1024
-print(f"  ✅ ONNX model saved: {onnx_size:.1f} KB")
-print(f"  Input shape: [batch, {X.shape[1]}]")
-print(f"  Output: [SELL_prob, HOLD_prob, BUY_prob]")
-
-# ── STEP 5: SAVE METADATA ─────────────────────────────────────────
-print("\n[5/5] Saving metadata...")
-
-metadata = {
-    "trained_at": pd.Timestamp.now().isoformat(),
-    "accuracy": float(acc),
-    "pairs_used": list(all_data.keys()),
-    "n_samples": int(len(X)),
-    "n_features": int(X.shape[1]),
-    "model_size_kb": float(onnx_size),
-    "scaler_mean":  scaler.mean_.tolist(),
-    "scaler_scale": scaler.scale_.tolist(),
-}
+sig=[tf.TensorSpec([None,SEQ_LEN,N_FEAT],tf.float32,name="input")]
+tf2onnx.convert.from_keras(model,input_signature=sig,opset=12,
+                            output_path="model/ForexSniper_AI.onnx")
+onnx.checker.check_model(onnx.load("model/ForexSniper_AI.onnx"))
+sz=os.path.getsize("model/ForexSniper_AI.onnx")/1024
 
 with open("model/metadata.json","w") as f:
-    json.dump(metadata, f, indent=2)
+    json.dump({
+        "trained_at": pd.Timestamp.now().isoformat(),
+        "accuracy": float(acc),
+        "architecture": "LSTM-128+LSTM-64+Attention+Dense-64-32-3",
+        "sequence_len": SEQ_LEN,
+        "n_features": int(N_FEAT),
+        "n_samples": int(len(X_seq)),
+        "pairs_used": list(all_data.keys()),
+        "model_size_kb": float(sz),
+        "scaler_mean": scaler.mean_.tolist(),
+        "scaler_scale": scaler.scale_.tolist(),
+    },f,indent=2)
 
 print(f"\n{'='*60}")
-print(f"  ✅ REAL AI MODEL TRAINED SUCCESSFULLY!")
-print(f"  Accuracy: {acc*100:.2f}%")
-print(f"  Pairs: {list(all_data.keys())}")
-print(f"  Samples: {len(X):,}")
-print(f"  Model: model/ForexSniper_AI.onnx")
+print(f"  LSTM MODEL READY!")
+print(f"  Accuracy:     {acc*100:.2f}%")
+print(f"  Architecture: LSTM-128 + LSTM-64 + Attention")
+print(f"  Features:     {N_FEAT} (incl. Supply/Demand)")
+print(f"  Sequence:     {SEQ_LEN} candle lookback")
+print(f"  Size:         {sz:.1f} KB")
 print(f"{'='*60}")
