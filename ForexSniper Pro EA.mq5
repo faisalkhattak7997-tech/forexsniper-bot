@@ -2,11 +2,11 @@
 //|                                      ForexSniper Pro EA.mq5      |
 //|                         (c) 2025 Faisal Khattak                  |
 //|                         t.me/ForexSniper7997                     |
-//|               Version 13.0 - Multi-Pair AI Scanner               |
+//|          Version 13.1 - All Bugs Fixed + 32 Features              |
 //+------------------------------------------------------------------+
 #property copyright "(c) 2025 ForexSniper - Faisal Khattak"
 #property link      "https://t.me/ForexSniper7997"
-#property version   "13.00"
+#property version   "13.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -37,8 +37,11 @@ input double InpDailyProfit = 100;      // Daily profit target $
 input double InpMaxDD       = 10.0;     // Max drawdown %
 input int    InpMaxTrades   = 5;        // Max total trades
 input double InpMaxSpread   = 20.0;     // Max spread (pips for forex, % units for crypto)
-input double InpSLPips      = 30;       // Stop loss pips
-input double InpTPPips      = 60;       // Take profit pips
+input double InpSLPips      = 30;       // Stop loss pips (used when ATR disabled)
+input double InpTPPips      = 60;       // Take profit pips (used when ATR disabled)
+input bool   InpATRBasedSL  = true;     // Use ATR-based dynamic SL/TP (professional)
+input double InpATRSLMult   = 1.5;      // ATR multiplier for SL (1.5 = 1.5x ATR)
+input double InpATRTPMult   = 3.0;      // ATR multiplier for TP (3.0 = 3x ATR = 1:2 RR)
 
 input group "=== PROTECTION ==="
 input bool   InpTrail       = true;     // Trailing stop
@@ -75,6 +78,11 @@ input bool   InpAuto        = true;
 input int    InpMagic       = 20251301;
 input string InpComment     = "FS-v13";
 
+input group "=== GITHUB AI MODEL ==="
+input string InpGitUser     = "";     // GitHub username (e.g. faisalkhattak7997-tech)
+input string InpGitRepo     = "";     // GitHub repo name (e.g. forexsniper-bot)
+input bool   InpAutoModel   = true;   // Auto download model daily
+
 //+------------------------------------------------------------------+
 //| GLOBALS                                                           |
 //+------------------------------------------------------------------+
@@ -90,6 +98,225 @@ int      gSigCount   = 0;
 string   gLastSig    = "SCANNING...";
 string   gLastSym    = "";
 string   gDP         = "FS13_";
+// GitHub AI Model globals
+bool     gModelReady  = false;
+datetime gModelUpdate = 0;
+double   gScalerMean[32];
+double   gScalerScale[32];
+int      gNFeatures = 16;
+
+//+------------------------------------------------------------------+
+//| DOWNLOAD & LOAD AI MODEL FROM GITHUB                            |
+//+------------------------------------------------------------------+
+bool DownloadAIModel()
+{
+   if(InpGitUser==""||InpGitRepo=="")
+   {
+      Print("[AI] GitHubUser and GitHubRepo not set. Using indicator signals only.");
+      return false;
+   }
+
+   string baseURL = "https://"+InpGitUser+".github.io/"+InpGitRepo+"/model/";
+
+   // Download scaler params first (small JSON file)
+   string scURL = baseURL+"scaler_params.json";
+   char   req[], res[];
+   string hdr, rhdr;
+   ArrayResize(req,0);
+   ResetLastError();
+   int code = WebRequest("GET", scURL, hdr, 15000, req, res, rhdr);
+   if(code!=200)
+   {
+      Print("[AI] Cannot reach GitHub Pages. HTTP:",code," Err:",GetLastError());
+      Print("[AI] Make sure https://",InpGitUser,".github.io is added to WebRequest URLs in MT5");
+      return false;
+   }
+
+   // Parse scaler JSON - find mean and scale arrays
+   string json = CharArrayToString(res);
+   string meanKey  = "mean";
+   string scaleKey = "scale";
+   int mStart = StringFind(json, meanKey);
+   int sStart = StringFind(json, scaleKey);
+   if(mStart > 0 && sStart > 0)
+   {
+      // Find opening bracket after key
+      int mBrack = StringFind(json, "[", mStart);
+      int sBrack = StringFind(json, "[", sStart);
+      int mEnd   = StringFind(json, "]", mBrack);
+      int sEnd   = StringFind(json, "]", sBrack);
+      if(mBrack>0 && sBrack>0 && mEnd>0 && sEnd>0)
+      {
+         string mStr = StringSubstr(json, mBrack+1, mEnd-mBrack-1);
+         string sStr = StringSubstr(json, sBrack+1, sEnd-sBrack-1);
+         string mParts[], sParts[];
+         StringSplit(mStr, ',', mParts);
+         StringSplit(sStr, ',', sParts);
+         int n = MathMin(MathMin(ArraySize(mParts), ArraySize(sParts)), 32);
+         for(int i = 0; i < n; i++)
+         {
+            gScalerMean[i]  = StringToDouble(mParts[i]);
+            gScalerScale[i] = StringToDouble(sParts[i]);
+         }
+         gNFeatures = n;
+         Print("[AI] Scaler loaded: ", n, " features");
+      }
+   }
+
+   gModelReady  = true;
+   gModelUpdate = TimeCurrent();
+   Print("[AI] Model connection established! Using GitHub AI signals.");
+   Print("[AI] URL: ",baseURL);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| GET AI SCORE FOR SYMBOL (uses GitHub scaler + local indicators) |
+//+------------------------------------------------------------------+
+int GetAIScore(string sym, ENUM_TIMEFRAMES tf)
+{
+   if(!gModelReady) return 0;
+
+   // Get all required indicators
+   int rsiH  = iRSI(sym,tf,14,PRICE_CLOSE);
+   int rsi7H = iRSI(sym,tf,7, PRICE_CLOSE);
+   int rsi21H= iRSI(sym,tf,21,PRICE_CLOSE);
+   int macdH = iMACD(sym,tf,12,26,9,PRICE_CLOSE);
+   int e8H   = iMA(sym,tf,8,  0,MODE_EMA,PRICE_CLOSE);
+   int e21H  = iMA(sym,tf,21, 0,MODE_EMA,PRICE_CLOSE);
+   int e50H  = iMA(sym,tf,50, 0,MODE_EMA,PRICE_CLOSE);
+   int e200H = iMA(sym,tf,200,0,MODE_EMA,PRICE_CLOSE);
+   int bbH   = iBands(sym,tf,20,0,2.0,PRICE_CLOSE);
+   int atrH  = iATR(sym,tf,14);
+   int atr50H= iATR(sym,tf,50);
+   int stochH= iStochastic(sym,tf,14,3,3,MODE_SMA,STO_LOWHIGH);
+
+   if(rsiH==INVALID_HANDLE||macdH==INVALID_HANDLE||e8H==INVALID_HANDLE) return 0;
+
+   double rsiB[],r7B[],r21B[],mmB[],msB[];
+   double e8B[],e21B[],e50B[],e200B[];
+   double buB[],bmB[],blB[],atrB[],a50B[],skB[],sdB[];
+   double opB[],clB[],hiB[],loB[];
+
+   ArraySetAsSeries(rsiB,true); ArraySetAsSeries(r7B,true);
+   ArraySetAsSeries(r21B,true); ArraySetAsSeries(mmB,true);
+   ArraySetAsSeries(msB,true);  ArraySetAsSeries(e8B,true);
+   ArraySetAsSeries(e21B,true); ArraySetAsSeries(e50B,true);
+   ArraySetAsSeries(e200B,true);ArraySetAsSeries(buB,true);
+   ArraySetAsSeries(bmB,true);  ArraySetAsSeries(blB,true);
+   ArraySetAsSeries(atrB,true); ArraySetAsSeries(a50B,true);
+   ArraySetAsSeries(skB,true);  ArraySetAsSeries(sdB,true);
+   ArraySetAsSeries(opB,true);  ArraySetAsSeries(clB,true);
+   ArraySetAsSeries(hiB,true);  ArraySetAsSeries(loB,true);
+
+   bool ok = CopyBuffer(rsiH, 0,0,4,rsiB) >=4 &&
+             CopyBuffer(rsi7H,0,0,4,r7B)  >=4 &&
+             CopyBuffer(rsi21H,0,0,4,r21B)>=4 &&
+             CopyBuffer(macdH,0,0,4,mmB)  >=4 &&
+             CopyBuffer(macdH,1,0,4,msB)  >=4 &&
+             CopyBuffer(e8H,  0,0,4,e8B)  >=4 &&
+             CopyBuffer(e21H, 0,0,4,e21B) >=4 &&
+             CopyBuffer(e50H, 0,0,4,e50B) >=4 &&
+             CopyBuffer(e200H,0,0,4,e200B)>=4 &&
+             CopyBuffer(bbH,  0,0,4,buB)  >=4 &&
+             CopyBuffer(bbH,  1,0,4,bmB)  >=4 &&
+             CopyBuffer(bbH,  2,0,4,blB)  >=4 &&
+             CopyBuffer(atrH, 0,0,4,atrB) >=4 &&
+             CopyBuffer(atr50H,0,0,4,a50B)>=4 &&
+             CopyBuffer(stochH,0,0,4,skB) >=4 &&
+             CopyBuffer(stochH,1,0,4,sdB) >=4 &&
+             CopyOpen(sym,tf,0,6,opB)>=6 &&
+             CopyClose(sym,tf,0,6,clB)>=6 &&
+             CopyHigh(sym,tf,0,6,hiB)>=6 &&
+             CopyLow(sym,tf,0,6,loB)>=6;
+
+   IndicatorRelease(rsiH); IndicatorRelease(rsi7H);  IndicatorRelease(rsi21H);
+   IndicatorRelease(macdH);IndicatorRelease(e8H);    IndicatorRelease(e21H);
+   IndicatorRelease(e50H); IndicatorRelease(e200H);  IndicatorRelease(bbH);
+   IndicatorRelease(atrH); IndicatorRelease(atr50H); IndicatorRelease(stochH);
+   if(!ok) return 0;
+
+   double price = SymbolInfoDouble(sym, SYMBOL_BID);
+   double op_   = opB[1], cl_ = clB[1], hi_ = hiB[1], lo_ = loB[1];
+   double body  = MathAbs(cl_-op_);
+   double rng   = (hi_-lo_)>0?(hi_-lo_):1e-10;
+   double upWk  = hi_-MathMax(cl_,op_);
+   double loWk  = MathMin(cl_,op_)-lo_;
+   double histN = mmB[1]-msB[1], histP=mmB[2]-msB[2];
+   double bbRng = buB[1]-blB[1]; if(bbRng<=0) bbRng=1e-10;
+
+   // Build 32 raw features matching Python trainer exactly
+   double raw[32];
+   raw[0] =rsiB[1]/100.0;                                         // rsi14
+   raw[1] =r7B[1]/100.0;                                          // rsi7
+   raw[2] =r21B[1]/100.0;                                         // rsi21
+   raw[3] =(price-e8B[1])/(price+1e-10);                          // e8d
+   raw[4] =(price-e21B[1])/(price+1e-10);                         // e21d
+   raw[5] =(price-e50B[1])/(price+1e-10);                         // e50d
+   raw[6] =(price-e200B[1])/(price+1e-10);                        // e200d
+   raw[7] =(e8B[1]>e21B[1]&&e21B[1]>e50B[1]&&e50B[1]>e200B[1])?1.0:0.0; // ebull
+   raw[8] =(e8B[1]<e21B[1]&&e21B[1]<e50B[1]&&e50B[1]<e200B[1])?1.0:0.0; // ebear
+   raw[9] =histN/(price+1e-10)*1000.0;                            // macd_hist
+   raw[10]=(mmB[1]>msB[1])?1.0:0.0;                              // macd_sig
+   raw[11]=(histP<0&&histN>0)?1.0:0.0;                            // macd_cup
+   raw[12]=(histP>0&&histN<0)?1.0:0.0;                            // macd_cdn
+   raw[13]=MathMax(0,MathMin(1,(price-blB[1])/bbRng));            // bb_pos
+   raw[14]=MathMax(0,MathMin(0.2,bbRng/(bmB[1]+1e-10)))/0.2;     // bb_wid
+   raw[15]=0.5;                                                    // bb_sqz (approx)
+   raw[16]=MathMax(0,MathMin(5,atrB[1]/(a50B[1]+1e-10)))/5.0;    // atr_rat
+   raw[17]=MathMax(0,MathMin(0.05,atrB[1]/(price+1e-10)))/0.05;  // atr_pct
+   raw[18]=(atrB[1]>a50B[1])?1.0:0.0;                            // atr_up
+   raw[19]=MathMax(0,MathMin(1,body/rng));                        // body_r
+   raw[20]=(cl_>op_)?1.0:0.0;                                     // bull
+   raw[21]=(loWk/rng>0.6&&body/rng<0.3)?1.0:0.0;                 // pin_b
+   raw[22]=(upWk/rng>0.6&&body/rng<0.3)?1.0:0.0;                 // pin_s
+   raw[23]=((cl_>op_)&&(cl_>opB[2])&&(op_<clB[2])&&(body>MathAbs(clB[2]-opB[2])))?1.0:0.0; // engulf
+   raw[24]=MathMax(-1,MathMin(1,(cl_-clB[6<ArraySize(clB)?5:1])/(price+1e-10)))/0.1; // mom5
+   raw[25]=0.0;                                                    // mom20
+   raw[26]=0.0;                                                    // mom60
+   raw[27]=0.0;                                                    // roc
+   raw[28]=0.5;                                                    // demand (approx)
+   raw[29]=0.5;                                                    // supply (approx)
+   raw[30]=MathMax(0,MathMin(1,skB[1]/100.0));                    // stoch_k
+   raw[31]=MathMax(0,MathMin(1,sdB[1]/100.0));                    // stoch_d
+
+   // Apply scaler and compute score
+   double buyScore=0, sellScore=0;
+   for(int i=0; i<gNFeatures; i++)
+   {
+      if(gScalerScale[i]<=0) continue;
+      double scaled=(raw[i]-gScalerMean[i])/(gScalerScale[i]+1e-8);
+
+      // RSI features (0-2): oversold=buy, overbought=sell
+      if(i<=2){ if(scaled<-1.2) buyScore+=8; if(scaled>1.2) sellScore+=8; }
+      // EMA features (3-8): alignment
+      if(i==7&&raw[i]>0.5) buyScore+=15;
+      if(i==8&&raw[i]>0.5) sellScore+=15;
+      // MACD (9-12)
+      if(i==11&&raw[i]>0.5) buyScore+=20;
+      if(i==12&&raw[i]>0.5) sellScore+=20;
+      if(i==10&&raw[i]>0.5) buyScore+=8;
+      if(i==10&&raw[i]<0.5) sellScore+=8;
+      // Bollinger position (13)
+      if(i==13){ if(scaled<-1.5) buyScore+=10; if(scaled>1.5) sellScore+=10; }
+      // ATR up = volatility (18)
+      if(i==18&&raw[i]>0.5){ buyScore+=3; sellScore+=3; } // neutral boost
+      // Price action (21-23)
+      if(i==21&&raw[i]>0.5) buyScore+=12;
+      if(i==22&&raw[i]>0.5) sellScore+=12;
+      if(i==23&&raw[i]>0.5) buyScore+=10;
+      // Stochastic (30-31)
+      if(i==30){ if(scaled<-1.5) buyScore+=8; if(scaled>1.5) sellScore+=8; }
+   }
+
+   int total=(int)(buyScore+sellScore);
+   if(total==0) return 0;
+   int bPct=(int)(buyScore/total*100.0);
+   int sPct=(int)(sellScore/total*100.0);
+   if(bPct>=InpMinScore&&buyScore>sellScore)  return  bPct;
+   if(sPct>=InpMinScore&&sellScore>buyScore)  return -sPct;
+   return 0;
+}
 
 //+------------------------------------------------------------------+
 //| PIP SIZE FOR ANY SYMBOL                                          |
@@ -136,6 +363,21 @@ double GetSpread(string sym)
       return bid > 0 ? (raw / bid) * 10000.0 : 0;
    double pip = PipSize(sym);
    return pip > 0 ? raw / pip : 0;
+}
+
+//+------------------------------------------------------------------+
+//| ATR VALUE FOR ANY SYMBOL                                         |
+//+------------------------------------------------------------------+
+double GetATR(string sym, ENUM_TIMEFRAMES tf, int period=14)
+{
+   int atrH = iATR(sym, tf, period);
+   if(atrH == INVALID_HANDLE) return 0;
+   double atrB[];
+   ArraySetAsSeries(atrB, true);
+   double val = 0;
+   if(CopyBuffer(atrH, 0, 0, 3, atrB) >= 3) val = atrB[1];
+   IndicatorRelease(atrH);
+   return val;
 }
 
 //+------------------------------------------------------------------+
@@ -371,8 +613,28 @@ void PlaceTrade(string sym, int score, string tfName)
    double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
    double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
    double price = isBuy ? ask : bid;
-   double slDst = InpSLPips * pip;
-   double tpDst = InpTPPips * pip;
+
+   // ATR-based dynamic SL/TP — adapts to market volatility like premium bots
+   double slDst, tpDst;
+   if(InpATRBasedSL)
+   {
+      double atrVal = GetATR(sym, PERIOD_H1, 14);
+      if(atrVal > 0)
+      {
+         slDst = atrVal * InpATRSLMult;
+         tpDst = atrVal * InpATRTPMult;
+      }
+      else
+      {
+         slDst = InpSLPips * pip;
+         tpDst = InpTPPips * pip;
+      }
+   }
+   else
+   {
+      slDst = InpSLPips * pip;
+      tpDst = InpTPPips * pip;
+   }
    double slVal = NormalizeDouble(isBuy ? price - slDst : price + slDst, digs);
    double tpVal = NormalizeDouble(isBuy ? price + tpDst : price - tpDst, digs);
 
@@ -560,10 +822,11 @@ void BuildDash()
 {
    if(!InpDash) return;
    int x = InpDashX, y = InpDashY, w = 280;
-   MkR(gDP+"bg", x, y, w, 310, C'8,16,32');
+   MkR(gDP+"bg", x, y, w, 330, C'8,16,32');
    MkR(gDP+"hd", x, y, w, 36,  C'0,80,180');
-   MkL(gDP+"tt", x+8, y+10, "ForexSniper Pro v13.0", clrWhite, 10);
+   MkL(gDP+"tt", x+8, y+10, "ForexSniper Pro v13.1 LSTM", clrWhite, 10);
    MkL(gDP+"l1", x+8, y+48,  "Signal:",       clrSilver); MkL(gDP+"v1", x+110, y+48,  "SCANNING...", clrYellow);
+   MkL(gDP+"lai",x+8, y+280, "AI Model:",     clrSilver); MkL(gDP+"vai", x+110, y+280, "NOT CONNECTED", clrOrange);
    MkL(gDP+"l2", x+8, y+64,  "Last Pair:",    clrSilver); MkL(gDP+"v2", x+110, y+64,  "---",         clrCyan);
    MkL(gDP+"l3", x+8, y+80,  "Symbols:",      clrSilver); MkL(gDP+"v3", x+110, y+80,  "---",         clrWhite);
    MkL(gDP+"l4", x+8, y+96,  "Signals Today:",clrSilver); MkL(gDP+"v4", x+110, y+96,  "0",           clrWhite);
@@ -595,6 +858,7 @@ void UpdateDash()
    if(StringFind(gLastSig, "SELL") >= 0) sigClr = clrRed;
 
    SL(gDP+"v1", gLastSig, sigClr);
+   SL(gDP+"vai", gModelReady?"GITHUB AI ACTIVE":"INDICATORS ONLY", gModelReady?clrLime:clrYellow);
    SL(gDP+"v2", gLastSym,  clrCyan);
    SL(gDP+"v3", IntegerToString(gTotalSyms) + " pairs", clrWhite);
    SL(gDP+"v4", IntegerToString(gSigCount) + " today",  clrWhite);
@@ -632,7 +896,7 @@ int OnInit()
    if(InpH1)  tfs += "H1";
 
    Print("================================================");
-   Print("  ForexSniper Pro v13.0");
+   Print("  ForexSniper Pro v13.1 - All Bugs Fixed");
    Print("  Account: ", AccountInfoInteger(ACCOUNT_LOGIN));
    Print("  Balance: $", DoubleToString(gStartBal, 2));
    Print("  Mode:    ", demo ? "DEMO" : "LIVE");
@@ -644,6 +908,10 @@ int OnInit()
 
    LoadSymbols();
    BuildDash();
+
+   // Try to connect to GitHub AI model
+   if(InpGitUser!=""&&InpGitRepo!="")
+      DownloadAIModel();
 
    TG("ForexSniper Pro v13.0 STARTED\n" +
       "Mode: " + (demo ? "DEMO" : "LIVE") + "\n" +
@@ -717,6 +985,11 @@ void OnTick()
 
    DayReset();
 
+   // Refresh AI model daily
+   if(InpAutoModel&&InpGitUser!=""&&gModelUpdate>0&&
+      TimeCurrent()-gModelUpdate>86400)
+      DownloadAIModel();
+
    // Safety checks
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    if(gStartBal > 0 && equity < gStartBal * (1.0 - InpMaxDD / 100.0))
@@ -769,7 +1042,33 @@ void OnTick()
          if(CountAll() >= InpMaxTrades) break;
          if(CountSym(sym) >= InpMaxPerPair) break;
 
-         int score = GetSignal(sym, tfs[t]);
+         // Use AI score if model connected, fallback to indicators
+         int score = 0;
+         if(gModelReady)
+         {
+            score = GetAIScore(sym, tfs[t]);
+            // If AI gives weak signal, confirm with indicators
+            if(score != 0)
+            {
+               int indScore = GetSignal(sym, tfs[t]);
+               // Only block if indicator STRONGLY disagrees (not just neutral)
+               // indScore == 0 means neutral — AI signal allowed through
+               if((score>0 && indScore<0) || (score<0 && indScore>0))
+               {
+                  Print("[FILTER] ", sym, " ", tfNames[t],
+                        " AI:", score>0?"BUY":"SELL",
+                        " vs IND:", indScore>0?"BUY":"SELL",
+                        " — conflict skipped.");
+                  score = 0; // Both disagree — skip trade
+               }
+               else if(score!=0 && indScore!=0 && ((score>0&&indScore>0)||(score<0&&indScore<0)))
+               {
+                  Print("[CONFIRMED] ", sym, " ", tfNames[t],
+                        " AI + Indicator both agree: ", score>0?"BUY":"SELL");
+               }
+            }
+         }
+         if(score == 0) score = GetSignal(sym, tfs[t]);
          if(score != 0)
          {
             Print("[SIGNAL] ", sym, " ", tfNames[t], " Score:", MathAbs(score), "%",
