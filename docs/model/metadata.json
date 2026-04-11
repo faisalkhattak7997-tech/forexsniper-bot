@@ -1,6 +1,6 @@
 {
-  "trained_at": "2026-04-11T06:27:38.235079",
-  "accuracy": 0.47390910268030556,
+  "trained_at": "2026-04-11T06:35:04.488429",
+  "accuracy": 0.4678233846950667,
   "architecture": "LSTM-128+LSTM-64+Attention+Dense-64-32-3",
   "sequence_len": 20,
   "n_features": 32,
@@ -13,7 +13,7 @@
     "XAUUSD",
     "BTCUSD"
   ],
-  "model_size_kb": 567.392578125,
+  "model_size_kb": 567.48828125,
   "version": "2.1-LSTM-32feat",
   "scaler_mean": [
     0.51080022830889,
