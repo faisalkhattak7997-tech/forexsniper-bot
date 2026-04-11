@@ -177,7 +177,7 @@ def build_features(df):
 
     return ft.dropna()
 
-def build_labels(df, fidx, horizon=3, thresh=0.0002):
+def build_labels(df, fidx, horizon=3, thresh=0.0003):  # Higher threshold = better quality signals
     df.columns = [str(col).strip() for col in df.columns]
     c  = df['Close'].squeeze().reindex(fidx)
     r  = c.shift(-horizon) / c - 1
