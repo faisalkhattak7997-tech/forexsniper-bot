@@ -1,0 +1,7 @@
+{
+  "buy_threshold": 0.55,
+  "sell_threshold": 0.55,
+  "min_score_demo": 45,
+  "min_score_live": 70,
+  "version": "13.4"
+}
