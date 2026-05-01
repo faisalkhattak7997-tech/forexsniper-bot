@@ -3,5 +3,20 @@
   "sell_threshold": 0.55,
   "min_score_demo": 45,
   "min_score_live": 70,
-  "version": "14.0"
+  "results": {
+    "BTCUSD": {
+      "accuracy": 36.4,
+      "f1": 0.344
+    },
+    "ETHUSD": {
+      "accuracy": 36.0,
+      "f1": 0.337
+    },
+    "XAUUSD": {
+      "accuracy": 36.8,
+      "f1": 0.366
+    }
+  },
+  "version": "14.0",
+  "model": "DLSTM_PerPair"
 }
